@@ -19,6 +19,36 @@ OP_RZ  = 2
 OP_RZZ = 3
 
 
+
+
+
+
+def random_haar_state(n_qubits, dtype=np.complex128, rng=None):
+    """
+    Generate a Haar-random n-qubit pure state.
+
+    Returns
+    -------
+    psi : ndarray, shape (2**n_qubits,)
+        Normalized complex statevector.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dim = 2 ** n_qubits
+
+    real = rng.normal(size=dim)
+    imag = rng.normal(size=dim)
+
+    psi = real + 1j * imag
+    psi /= np.linalg.norm(psi)
+
+    return psi.astype(dtype)
+
+
+
+
+
 # -----------------------------
 # Gate matrices (2x2)
 # -----------------------------
@@ -106,11 +136,7 @@ def apply_rzz(psi, theta, q1, q2, n_qubits):
 # -----------------------------
 # Main runner
 # -----------------------------
-def run_program_arrays(n_qubits,
-                       params,
-                       op_codes,
-                       q1,
-                       q2):
+def apply_unitary(n_qubits,params,op_codes,q1,q2):
     """
     Execute a gate program.
 
@@ -141,25 +167,26 @@ def run_program_arrays(n_qubits,
 
     return psi
 
+def loss(n_qubits,params,op_codes,q1,q2,target_state):
+    psi = apply_unitary(n_qubits=12,params=params,op_codes=op_codes,q1=q1,q2=q2)
+    return -abs(np.vdot(target_state, psi)) ** 2
+
 
 # -----------------------------
 # Example usage
 # -----------------------------
 if __name__ == "__main__":
+    n_qubits=12
     params   = np.array([0.1, 0.2, 0.7], dtype=float)
     op_codes = np.array([OP_RX, OP_RZZ, OP_RY], dtype=int)
     q1       = np.array([0, 0, 5], dtype=int)
     q2       = np.array([0, 1, 0], dtype=int)
+    psi = random_haar_state(n_qubits)
 
-    psi = run_program_arrays(
-        n_qubits=12,
-        params=params,
-        op_codes=op_codes,
-        q1=q1,
-        q2=q2
-    )
+    loss = loss(n_qubits=n_qubits,params=params,op_codes=op_codes,q1=q1,q2=q2,target_state=psi)
+    print(-loss)
 
-    norm = np.vdot(psi, psi).real
-    print("Final state shape:", psi.shape)
-    print("Norm:", norm)
-    print("First 8 amplitudes:", psi[:8])
+    # norm = np.vdot(psi, psi).real
+    # print("Final state shape:", psi.shape)
+    # print("Norm:", norm)
+    # print("First 8 amplitudes:", psi[:8])
