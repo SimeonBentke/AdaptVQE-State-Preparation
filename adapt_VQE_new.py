@@ -11,6 +11,7 @@ Stopping rule (MODIFIED):
 
 import numpy as np
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 
 
 # -----------------------------
@@ -383,36 +384,150 @@ def adapt_vqe(
 
 
 # -----------------------------
-# Main
+# Main (complete): run ADAPT-VQE and plot Fidelity + |ΔF| in one figure
 # -----------------------------
 if __name__ == "__main__":
-    n_qubits = 10
-    max_op   = 20
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    n_qubits = 12
+    max_op   = 150
 
     # Stop when fidelity changes less than eps_fid for `patience` consecutive steps
-    eps_fid  = 1e-5
+    eps_fid  = 1e-6
     patience = 10
 
+    # Build problem
     pool = make_default_pool(n_qubits)
     target = random_haar_state(n_qubits)
-
-    params, op_codes, q1, q2 = adapt_vqe(
-        n_qubits,
-        target,
-        pool,
-        max_op,
-        eps_fid=eps_fid,
-        patience=patience,
-        method="L-BFGS-B",
-        maxiter=200,
-        grad_eps=1e-6,
-    )
-
     signs = precompute_rzz_signs(n_qubits)
-    best_fid = -loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
 
-    print("\nop_codes:", op_codes)
-    print("Best fidelity:", best_fid)
+    # Track fidelity and its change per step
+    fidelities = []
+    delta_fidelities = []
+
+    # Initialize empty ansatz
+    params   = np.array([], dtype=float)
+    op_codes = np.array([], dtype=int)
+    q1       = np.array([], dtype=int)
+    q2       = np.array([], dtype=int)
+
+    prev_fid = 0.0
+    small_count = 0
+
+    # ADAPT loop (one operator per step)
+    for i in range(max_op):
+        params, op_codes, q1, q2, score = find_best_op(
+            n_qubits,
+            params,
+            op_codes,
+            q1,
+            q2,
+            target,
+            pool=pool,
+            method="L-BFGS-B",
+            maxiter=200,
+            signs=signs,
+            grad_eps=1e-6,
+        )
+
+        fid = -loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
+        fidelities.append(fid)
+
+        delta = abs(fid - prev_fid)
+        delta_fidelities.append(delta)
+
+        print(f"step {i+1:3d}/{max_op} | fidelity: {fid:.8f} | Δfid: {delta:.2e} | score: {score:.2e}")
+
+        # Convergence check: consecutive small changes in fidelity
+        if i > 0 and delta < eps_fid:
+            small_count += 1
+        else:
+            small_count = 0
+
+        if small_count >= patience:
+            print(f"Stopping early: |Δfid| < {eps_fid} for {patience} consecutive steps.")
+            break
+
+        prev_fid = fid
+
+    # Final summary
+    print("\nFinal results")
+    print("Number of operators:", len(op_codes))
+    print("Best fidelity:", fidelities[-1] if fidelities else 0.0)
     print("Best op_codes:", op_codes)
     print("Best q1:", q1)
     print("Best q2:", q2)
+
+    # Plot: fidelity (linear) + |ΔF| (log) in the same figure
+    steps = np.arange(1, len(fidelities) + 1)
+
+    fig, ax1 = plt.subplots()
+
+    # Fidelity on left axis (linear)
+    ax1.plot(steps, fidelities, marker="o", label="Fidelity")
+    ax1.set_xlabel("Number of operators")
+    ax1.set_ylabel("Fidelity")
+    #ax1.set_ylim(0.0, 1.05)
+    ax1.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+    # |ΔF| on right axis (log)
+    ax2 = ax1.twinx()
+    ax2.plot(steps, delta_fidelities, marker="s", linestyle="--", label="|Δ Fidelity|")
+    ax2.set_ylabel("|Δ Fidelity|")
+    ax2.set_yscale("log")
+    #ax2.set_ylim(bottom=1e-16)
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+    plt.title("ADAPT-VQE convergence: fidelity and per-step improvement")
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# if __name__ == "__main__":
+#     n_qubits = 12
+#     max_op   = 100
+
+#     # Stop when fidelity changes less than eps_fid for `patience` consecutive steps
+#     eps_fid  = 1e-6
+#     patience = 10
+
+#     pool = make_default_pool(n_qubits)
+#     target = random_haar_state(n_qubits)
+
+#     params, op_codes, q1, q2 = adapt_vqe(
+#         n_qubits,
+#         target,
+#         pool,
+#         max_op,
+#         eps_fid=eps_fid,
+#         patience=patience,
+#         method="L-BFGS-B",
+#         maxiter=200,
+#         grad_eps=1e-6,
+#     )
+
+#     signs = precompute_rzz_signs(n_qubits)
+#     best_fid = -loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
+
+#     print("\nop_codes:", op_codes)
+#     print("Best fidelity:", best_fid)
+#     print("Best op_codes:", op_codes)
+#     print("Best q1:", q1)
+#     print("Best q2:", q2)
