@@ -1,20 +1,12 @@
 """
-NumPy ADAPT-style gate program runner (with jac=True via parameter-shift gradient)
+NumPy ADAPT-style gate program runner (with jac=True + ADAPT gradient-based operator selection)
+
 - No classes; pass arrays directly.
 - Supports RX / RY / RZ and RZZ
 - Qubit indexing: q = 0 is least-significant bit (LSB)
 
-IMPORTANT:
-- This version uses SciPy minimize(..., jac=True) by providing a function that returns (value, grad).
-- The gradient is computed with the parameter-shift rule (2 circuit evaluations per parameter).
-  This can be substantially more expensive per optimizer step than finite-differences for large parameter counts,
-  but it is a correct "jac=True" implementation and often numerically more stable.
-
-Also includes the two big simulator speedups:
-1) 1-qubit gates applied in-place (no full statevector copy per gate).
-2) RZZ sign patterns precomputed once per (q1,q2), reused every call.
-
-Self-contained and runnable.
+Stopping rule (MODIFIED):
+- Stop when fidelity changes less than eps_fid for `patience` consecutive ADAPT steps.
 """
 
 import numpy as np
@@ -28,6 +20,9 @@ OP_RX  = 0
 OP_RY  = 1
 OP_RZ  = 2
 OP_RZZ = 3
+
+# Parameter-shift amount
+SHIFT = np.pi / 2
 
 
 def make_default_pool(n_qubits):
@@ -139,9 +134,6 @@ def precompute_rzz_signs(n_qubits):
 
 
 def rzz_apply_inplace(psi, theta, q1, q2, signs):
-    """
-    Apply RZZ(theta) IN PLACE using precomputed signs.
-    """
     a, b = (q1, q2) if q1 < q2 else (q2, q1)
     s = signs[(a, b)]
     psi *= np.exp(-1j * theta / 2 * s)
@@ -168,7 +160,6 @@ def apply_unitary(n_qubits, params, op_codes, q1, q2, signs=None):
 
         elif op == OP_RZZ:
             if signs is None:
-                # Correct fallback (slower)
                 dim = psi.shape[0]
                 idx = np.arange(dim, dtype=np.int64)
                 b1 = (idx >> int(q1[i])) & 1
@@ -196,19 +187,16 @@ def loss(n_qubits, params, op_codes, q1, q2, target_state, signs=None):
 
 
 # -----------------------------
-# jac=True via parameter-shift
+# jac=True via parameter-shift (FULL gradient for SciPy)
 # -----------------------------
-SHIFT = np.pi / 2
-
-
 def value_and_grad(p, n_qubits, op_codes, q1, q2, target_state, signs):
     """
     Return (loss(p), grad_loss(p)) for SciPy with jac=True.
-    Parameter-shift: grad_k = 0.5*(L(p+shift e_k) - L(p-shift e_k)).
+    Parameter-shift:
+      dL/dp_k = 0.5*(L(p+SHIFT e_k) - L(p-SHIFT e_k))
     """
     p = np.asarray(p, dtype=float)
 
-    # base value
     base = loss(n_qubits, p, op_codes, q1, q2, target_state, signs=signs)
 
     grad = np.zeros_like(p)
@@ -226,11 +214,18 @@ def value_and_grad(p, n_qubits, op_codes, q1, q2, target_state, signs):
     return base, grad
 
 
-def optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
-                    method="L-BFGS-B", maxiter=200, signs=None, disp=False):
-    """
-    Minimize loss(params) using SciPy with jac=True.
-    """
+def optimize_params(
+    n_qubits,
+    params,
+    op_codes,
+    q1,
+    q2,
+    target_state,
+    method="L-BFGS-B",
+    maxiter=200,
+    signs=None,
+    disp=False,
+):
     if signs is None:
         signs = precompute_rzz_signs(n_qubits)
 
@@ -248,48 +243,94 @@ def optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
 
 
 # -----------------------------
-# ADAPT outer loop (naive selection: optimize each pool element)
+# ADAPT: gradient-based operator selection
 # -----------------------------
-def find_best_op(n_qubits, params, op_codes, q1, q2, target_state, pool,
-                 method="L-BFGS-B", maxiter=200, signs=None):
-
+def find_best_op(
+    n_qubits,
+    params,
+    op_codes,
+    q1,
+    q2,
+    target_state,
+    pool,
+    method="L-BFGS-B",
+    maxiter=200,
+    signs=None,
+    grad_eps=1e-6,
+):
     if signs is None:
         signs = precompute_rzz_signs(n_qubits)
 
-    opt_old = optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
-                              method=method, maxiter=maxiter, signs=signs, disp=False)
-    old_loss = float(opt_old.fun)
+    # 1) Optimize current circuit once
+    if len(params) > 0:
+        opt_old = optimize_params(
+            n_qubits, params, op_codes, q1, q2, target_state,
+            method=method, maxiter=maxiter, signs=signs, disp=False
+        )
+        params_opt = np.array(opt_old.x, dtype=float)
+    else:
+        params_opt = np.array(params, dtype=float)
 
-    best_improvement = 0.0
+    # 2) Score candidates by gradient of NEW parameter
+    best_score = 0.0
     best_choice = None
-    best_params_full = None
 
     for (op, qq1, qq2) in pool:
-        params_new   = np.append(params, 0.0)
-        op_codes_new = np.append(op_codes, op)
-        q1_new       = np.append(q1, qq1)
-        q2_new       = np.append(q2, qq2)
+        op_codes_ext = np.append(op_codes, op)
+        q1_ext = np.append(q1, qq1)
+        q2_ext = np.append(q2, qq2)
 
-        opt_new = optimize_params(n_qubits, params_new, op_codes_new, q1_new, q2_new, target_state,
-                                  method=method, maxiter=maxiter, signs=signs, disp=False)
-        new_loss = float(opt_new.fun)
+        p0 = np.append(params_opt, 0.0)
 
-        improvement = old_loss - new_loss
+        p_plus = p0.copy()
+        p_minus = p0.copy()
+        p_plus[-1] += SHIFT
+        p_minus[-1] -= SHIFT
 
-        if improvement > best_improvement:
-            best_improvement = improvement
-            best_choice = (op_codes_new, q1_new, q2_new)
-            best_params_full = opt_new.x
+        lp = loss(n_qubits, p_plus, op_codes_ext, q1_ext, q2_ext, target_state, signs=signs)
+        lm = loss(n_qubits, p_minus, op_codes_ext, q1_ext, q2_ext, target_state, signs=signs)
 
-    if best_choice is None:
-        return params, op_codes, q1, q2, 0.0
+        grad_new = 0.5 * (lp - lm)
+        score = float(np.abs(grad_new))
 
-    op_codes_new, q1_new, q2_new = best_choice
-    params_new = best_params_full
-    return params_new, op_codes_new, q1_new, q2_new, best_improvement
+        if score > best_score:
+            best_score = score
+            best_choice = (op, qq1, qq2)
+
+    if best_choice is None or best_score < grad_eps:
+        return params_opt, op_codes, q1, q2, 0.0
+
+    # 3) Append best gate and optimize ONCE
+    op_best, qq1_best, qq2_best = best_choice
+
+    op_codes_new = np.append(op_codes, op_best)
+    q1_new = np.append(q1, qq1_best)
+    q2_new = np.append(q2, qq2_best)
+    params_new0 = np.append(params_opt, 0.0)
+
+    opt_new = optimize_params(
+        n_qubits, params_new0, op_codes_new, q1_new, q2_new, target_state,
+        method=method, maxiter=maxiter, signs=signs, disp=False
+    )
+    params_new = np.array(opt_new.x, dtype=float)
+
+    return params_new, op_codes_new, q1_new, q2_new, best_score
 
 
-def adapt_vqe(n_qubits, target, pool, max_op, eps=0.01, method="L-BFGS-B", maxiter=200):
+def adapt_vqe(
+    n_qubits,
+    target,
+    pool,
+    max_op,
+    eps_fid=1e-4,     # <-- fidelity threshold
+    patience=3,       # <-- number of consecutive small-change steps to stop
+    method="L-BFGS-B",
+    maxiter=200,
+    grad_eps=1e-6,
+):
+    """
+    Stop when |F_i - F_{i-1}| < eps_fid for `patience` consecutive steps.
+    """
     signs = precompute_rzz_signs(n_qubits)
 
     params   = np.array([], dtype=float)
@@ -297,16 +338,46 @@ def adapt_vqe(n_qubits, target, pool, max_op, eps=0.01, method="L-BFGS-B", maxit
     q1       = np.array([], dtype=int)
     q2       = np.array([], dtype=int)
 
-    for i in range(max_op):
-        print(f"operation: {i} ----- {i/max_op*100:.1f} %\n")
+    prev_fid = 0.0
+    small_change_count = 0
 
-        params, op_codes, q1, q2, imp = find_best_op(
-            n_qubits, params, op_codes, q1, q2, target, pool=pool,
-            method=method, maxiter=maxiter, signs=signs
+    for i in range(max_op):
+        # ADAPT step
+        params, op_codes, q1, q2, score = find_best_op(
+            n_qubits,
+            params,
+            op_codes,
+            q1,
+            q2,
+            target,
+            pool=pool,
+            method=method,
+            maxiter=maxiter,
+            signs=signs,
+            grad_eps=grad_eps,
         )
 
-        if imp < eps:
-            return params, op_codes, q1, q2
+        # Compute fidelity after this step (loss = -fidelity)
+        fid = -loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
+        delta = abs(fid - prev_fid)
+
+        print(
+            f"step {i+1:2d}/{max_op} | progress: {100*(i+1)/max_op:6.1f}%"
+            f" | score: {score:.3e} | fidelity: {fid:.8f} | Δfid: {delta:.3e}"
+            f" | smallΔ: {small_change_count}/{patience}"
+        )
+
+        # Update consecutive-small-change counter
+        if i > 0 and delta < eps_fid:
+            small_change_count += 1
+        else:
+            small_change_count = 0
+
+        # Stop if small change persisted for patience steps
+        if small_change_count >= patience:
+            break
+
+        prev_fid = fid
 
     return params, op_codes, q1, q2
 
@@ -315,23 +386,33 @@ def adapt_vqe(n_qubits, target, pool, max_op, eps=0.01, method="L-BFGS-B", maxit
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    n_qubits = 12
-    max_op   = 15
-    eps      = 0.0
+    n_qubits = 10
+    max_op   = 20
+
+    # Stop when fidelity changes less than eps_fid for `patience` consecutive steps
+    eps_fid  = 1e-5
+    patience = 10
 
     pool = make_default_pool(n_qubits)
     target = random_haar_state(n_qubits)
 
     params, op_codes, q1, q2 = adapt_vqe(
-        n_qubits, target, pool, max_op, eps=eps,
-        method="L-BFGS-B", maxiter=200
+        n_qubits,
+        target,
+        pool,
+        max_op,
+        eps_fid=eps_fid,
+        patience=patience,
+        method="L-BFGS-B",
+        maxiter=200,
+        grad_eps=1e-6,
     )
 
     signs = precompute_rzz_signs(n_qubits)
-    best_loss = loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
+    best_fid = -loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
 
     print("\nop_codes:", op_codes)
-    print("Best fidelity:", -best_loss)
+    print("Best fidelity:", best_fid)
     print("Best op_codes:", op_codes)
     print("Best q1:", q1)
     print("Best q2:", q2)
