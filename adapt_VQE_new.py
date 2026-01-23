@@ -1,10 +1,20 @@
 """
-NumPy ADAPT-style gate program runner
+NumPy ADAPT-style gate program runner (with jac=True via parameter-shift gradient)
 - No classes; pass arrays directly.
 - Supports RX / RY / RZ and RZZ
 - Qubit indexing: q = 0 is least-significant bit (LSB)
 
-This file is self-contained and runnable.
+IMPORTANT:
+- This version uses SciPy minimize(..., jac=True) by providing a function that returns (value, grad).
+- The gradient is computed with the parameter-shift rule (2 circuit evaluations per parameter).
+  This can be substantially more expensive per optimizer step than finite-differences for large parameter counts,
+  but it is a correct "jac=True" implementation and often numerically more stable.
+
+Also includes the two big simulator speedups:
+1) 1-qubit gates applied in-place (no full statevector copy per gate).
+2) RZZ sign patterns precomputed once per (q1,q2), reused every call.
+
+Self-contained and runnable.
 """
 
 import numpy as np
@@ -37,31 +47,13 @@ def make_default_pool(n_qubits):
     return pool
 
 
-
 def random_haar_state(n_qubits, dtype=np.complex128, rng=None):
-    """
-    Generate a Haar-random n-qubit pure state.
-
-    Returns
-    -------
-    psi : ndarray, shape (2**n_qubits,)
-        Normalized complex statevector.
-    """
     if rng is None:
         rng = np.random.default_rng()
-
     dim = 2 ** n_qubits
-
-    real = rng.normal(size=dim)
-    imag = rng.normal(size=dim)
-
-    psi = real + 1j * imag
+    psi = rng.normal(size=dim) + 1j * rng.normal(size=dim)
     psi /= np.linalg.norm(psi)
-
     return psi.astype(dtype)
-
-
-
 
 
 # -----------------------------
@@ -97,11 +89,11 @@ def init_state(n_qubits: int):
 
 
 # -----------------------------
-# Apply 1-qubit gate efficiently
+# Apply 1-qubit gate IN-PLACE
 # -----------------------------
-def apply_1q_gate(psi, U, q, n_qubits):
+def apply_1q_gate_inplace(psi, U, q, n_qubits):
     """
-    Apply a 2x2 gate U to qubit q (0 = LSB).
+    Apply a 2x2 gate U to qubit q (0 = LSB) IN PLACE.
     Complexity: O(2^n)
     """
     dim = psi.shape[0]
@@ -117,104 +109,156 @@ def apply_1q_gate(psi, U, q, n_qubits):
     i0 = base
     i1 = base | (1 << q)
 
-    a0 = psi[i0]
-    a1 = psi[i1]
+    # Copy only the touched amplitudes (size 2^(n-1)), NOT the full state
+    a0 = psi[i0].copy()
+    a1 = psi[i1].copy()
 
-    b0 = U[0, 0] * a0 + U[0, 1] * a1
-    b1 = U[1, 0] * a0 + U[1, 1] * a1
-
-    psi2 = psi.copy()
-    psi2[i0] = b0
-    psi2[i1] = b1
-    return psi2
+    psi[i0] = U[0, 0] * a0 + U[0, 1] * a1
+    psi[i1] = U[1, 0] * a0 + U[1, 1] * a1
 
 
 # -----------------------------
-# Apply RZZ gate
+# RZZ acceleration: precompute signs once
 # -----------------------------
-def apply_rzz(psi, theta, q1, q2, n_qubits):
+def precompute_rzz_signs(n_qubits):
     """
-    Apply RZZ(theta) = exp(-i theta/2 * Z⊗Z)
+    For each unordered pair (a,b), precompute s[idx] in {+1,-1} such that:
+      RZZ(theta) multiplies amplitude idx by exp(-i theta/2 * s[idx]).
     """
-    dim = psi.shape[0]
+    dim = 2 ** n_qubits
     idx = np.arange(dim, dtype=np.int64)
 
-    b1 = (idx >> q1) & 1
-    b2 = (idx >> q2) & 1
+    signs = {}
+    for a in range(n_qubits):
+        for b in range(a + 1, n_qubits):
+            b1 = (idx >> a) & 1
+            b2 = (idx >> b) & 1
+            s = np.where(b1 == b2, 1.0, -1.0)
+            signs[(a, b)] = s
+    return signs
 
-    s = np.where(b1 == b2, 1.0, -1.0)
-    phase = np.exp(-1j * theta / 2 * s)
 
-    return psi * phase
+def rzz_apply_inplace(psi, theta, q1, q2, signs):
+    """
+    Apply RZZ(theta) IN PLACE using precomputed signs.
+    """
+    a, b = (q1, q2) if q1 < q2 else (q2, q1)
+    s = signs[(a, b)]
+    psi *= np.exp(-1j * theta / 2 * s)
 
 
 # -----------------------------
-# Main runner
+# Circuit execution
 # -----------------------------
-def apply_unitary(n_qubits,params,op_codes,q1,q2):
-    """
-    Execute a gate program.
-
-    params   : (L,)
-    op_codes : (L,)
-    q1, q2   : (L,)
-    """
+def apply_unitary(n_qubits, params, op_codes, q1, q2, signs=None):
     psi = init_state(n_qubits)
 
     for i in range(len(params)):
-        theta = params[i]
-        op    = op_codes[i]
+        theta = float(params[i])
+        op    = int(op_codes[i])
 
         if op == OP_RX:
-            psi = apply_1q_gate(psi, RX(theta), q1[i], n_qubits)
+            apply_1q_gate_inplace(psi, RX(theta), int(q1[i]), n_qubits)
 
         elif op == OP_RY:
-            psi = apply_1q_gate(psi, RY(theta), q1[i], n_qubits)
+            apply_1q_gate_inplace(psi, RY(theta), int(q1[i]), n_qubits)
 
         elif op == OP_RZ:
-            psi = apply_1q_gate(psi, RZ(theta), q1[i], n_qubits)
+            apply_1q_gate_inplace(psi, RZ(theta), int(q1[i]), n_qubits)
 
         elif op == OP_RZZ:
-            psi = apply_rzz(psi, theta, q1[i], q2[i], n_qubits)
-
+            if signs is None:
+                # Correct fallback (slower)
+                dim = psi.shape[0]
+                idx = np.arange(dim, dtype=np.int64)
+                b1 = (idx >> int(q1[i])) & 1
+                b2 = (idx >> int(q2[i])) & 1
+                s = np.where(b1 == b2, 1.0, -1.0)
+                psi *= np.exp(-1j * theta / 2 * s)
+            else:
+                rzz_apply_inplace(psi, theta, int(q1[i]), int(q2[i]), signs)
         else:
             raise ValueError(f"Unknown op-code {op}")
 
     return psi
 
-def loss(n_qubits,params,op_codes,q1,q2,target_state):
-    psi = apply_unitary(n_qubits=n_qubits,params=params,op_codes=op_codes,q1=q1,q2=q2)
-    return -abs(np.vdot(target_state, psi)) ** 2
 
+# -----------------------------
+# Objective: loss = - fidelity
+# -----------------------------
+def fidelity(n_qubits, params, op_codes, q1, q2, target_state, signs=None):
+    psi = apply_unitary(n_qubits, params, op_codes, q1, q2, signs=signs)
+    return abs(np.vdot(target_state, psi)) ** 2
+
+
+def loss(n_qubits, params, op_codes, q1, q2, target_state, signs=None):
+    return -fidelity(n_qubits, params, op_codes, q1, q2, target_state, signs=signs)
+
+
+# -----------------------------
+# jac=True via parameter-shift
+# -----------------------------
+SHIFT = np.pi / 2
+
+
+def value_and_grad(p, n_qubits, op_codes, q1, q2, target_state, signs):
+    """
+    Return (loss(p), grad_loss(p)) for SciPy with jac=True.
+    Parameter-shift: grad_k = 0.5*(L(p+shift e_k) - L(p-shift e_k)).
+    """
+    p = np.asarray(p, dtype=float)
+
+    # base value
+    base = loss(n_qubits, p, op_codes, q1, q2, target_state, signs=signs)
+
+    grad = np.zeros_like(p)
+    for k in range(p.size):
+        p_plus = p.copy()
+        p_minus = p.copy()
+        p_plus[k] += SHIFT
+        p_minus[k] -= SHIFT
+
+        lp = loss(n_qubits, p_plus, op_codes, q1, q2, target_state, signs=signs)
+        lm = loss(n_qubits, p_minus, op_codes, q1, q2, target_state, signs=signs)
+
+        grad[k] = 0.5 * (lp - lm)
+
+    return base, grad
 
 
 def optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
-                    method="L-BFGS-B", maxiter=200):
+                    method="L-BFGS-B", maxiter=200, signs=None, disp=False):
     """
-    Minimize loss(params) using SciPy.
+    Minimize loss(params) using SciPy with jac=True.
+    """
+    if signs is None:
+        signs = precompute_rzz_signs(n_qubits)
 
-    Returns: OptimizeResult
-    """
-    def f(p):
-        return loss(n_qubits=n_qubits, params=p, op_codes=op_codes, q1=q1, q2=q2, target_state=target_state)
+    x0 = np.array(params, dtype=float)
 
     result = minimize(
-        f,
-        x0=np.array(params, dtype=float),
+        fun=value_and_grad,
+        x0=x0,
+        args=(n_qubits, op_codes, q1, q2, target_state, signs),
         method=method,
-        options={"maxiter": maxiter, "disp": True},
+        jac=True,
+        options={"maxiter": maxiter, "disp": disp},
     )
     return result
 
 
-
-
+# -----------------------------
+# ADAPT outer loop (naive selection: optimize each pool element)
+# -----------------------------
 def find_best_op(n_qubits, params, op_codes, q1, q2, target_state, pool,
-                 method="L-BFGS-B", maxiter=200):
+                 method="L-BFGS-B", maxiter=200, signs=None):
+
+    if signs is None:
+        signs = precompute_rzz_signs(n_qubits)
 
     opt_old = optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
-                              method=method, maxiter=maxiter)
-    old_loss = opt_old.fun
+                              method=method, maxiter=maxiter, signs=signs, disp=False)
+    old_loss = float(opt_old.fun)
 
     best_improvement = 0.0
     best_choice = None
@@ -227,68 +271,67 @@ def find_best_op(n_qubits, params, op_codes, q1, q2, target_state, pool,
         q2_new       = np.append(q2, qq2)
 
         opt_new = optimize_params(n_qubits, params_new, op_codes_new, q1_new, q2_new, target_state,
-                                  method=method, maxiter=maxiter)
-        new_loss = opt_new.fun
+                                  method=method, maxiter=maxiter, signs=signs, disp=False)
+        new_loss = float(opt_new.fun)
 
-        improvement = old_loss - new_loss  # positive means better (loss decreased)
+        improvement = old_loss - new_loss
 
         if improvement > best_improvement:
             best_improvement = improvement
-            best_choice = (op, qq1, qq2, op_codes_new, q1_new, q2_new)
-            best_params_full = opt_new.x     # FULL optimized param vector
+            best_choice = (op_codes_new, q1_new, q2_new)
+            best_params_full = opt_new.x
 
     if best_choice is None:
-        # no improvement found; return original
-        return params, op_codes, q1, q2
+        return params, op_codes, q1, q2, 0.0
 
-    op, qq1, qq2, op_codes_new, q1_new, q2_new = best_choice
-
-    # IMPORTANT: replace params with the full optimized vector (do NOT append)
+    op_codes_new, q1_new, q2_new = best_choice
     params_new = best_params_full
-
     return params_new, op_codes_new, q1_new, q2_new, best_improvement
 
+
 def adapt_vqe(n_qubits, target, pool, max_op, eps=0.01, method="L-BFGS-B", maxiter=200):
-    params  = np.array([], dtype=float)
+    signs = precompute_rzz_signs(n_qubits)
+
+    params   = np.array([], dtype=float)
     op_codes = np.array([], dtype=int)
     q1       = np.array([], dtype=int)
     q2       = np.array([], dtype=int)
 
     for i in range(max_op):
-        print("operation: ", i,"-----", i/max_op*100, " %")
-        print()
-        params, op_codes, q1, q2, imp=find_best_op(n_qubits, params, op_codes, q1, q2, target, pool=pool, 
-                                              method="L-BFGS-B", maxiter=200)
-        if imp<eps:
+        print(f"operation: {i} ----- {i/max_op*100:.1f} %\n")
+
+        params, op_codes, q1, q2, imp = find_best_op(
+            n_qubits, params, op_codes, q1, q2, target, pool=pool,
+            method=method, maxiter=maxiter, signs=signs
+        )
+
+        if imp < eps:
             return params, op_codes, q1, q2
+
     return params, op_codes, q1, q2
-        
 
 
-
-
-
-
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
     n_qubits = 12
-    max_op=20
-    eps=0
-    pool=make_default_pool(n_qubits)
+    max_op   = 15
+    eps      = 0.0
 
+    pool = make_default_pool(n_qubits)
     target = random_haar_state(n_qubits)
 
-    params, op_codes, q1, q2=adapt_vqe(n_qubits, target, pool, max_op, eps=eps, 
-                                       method="L-BFGS-B", maxiter=200)
+    params, op_codes, q1, q2 = adapt_vqe(
+        n_qubits, target, pool, max_op, eps=eps,
+        method="L-BFGS-B", maxiter=200
+    )
 
-    
-    best_loss=loss(n_qubits,params,op_codes,q1,q2,target)
-    
+    signs = precompute_rzz_signs(n_qubits)
+    best_loss = loss(n_qubits, params, op_codes, q1, q2, target, signs=signs)
 
-
-    
     print("\nop_codes:", op_codes)
     print("Best fidelity:", -best_loss)
-    #print("Best params:", params)
     print("Best op_codes:", op_codes)
     print("Best q1:", q1)
     print("Best q2:", q2)
