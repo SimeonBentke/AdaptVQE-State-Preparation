@@ -8,6 +8,7 @@ This file is self-contained and runnable.
 """
 
 import numpy as np
+from scipy.optimize import minimize
 
 
 # -----------------------------
@@ -19,7 +20,21 @@ OP_RZ  = 2
 OP_RZZ = 3
 
 
+def make_default_pool(n_qubits):
+    pool = []
 
+    # Single-qubit rotations
+    for q in range(n_qubits):
+        pool.append((OP_RX, q, 0))
+        pool.append((OP_RY, q, 0))
+        pool.append((OP_RZ, q, 0))
+
+    # Two-qubit ZZ rotations: all unordered pairs
+    for q1 in range(n_qubits):
+        for q2 in range(q1 + 1, n_qubits):
+            pool.append((OP_RZZ, q1, q2))
+
+    return pool
 
 
 
@@ -168,25 +183,112 @@ def apply_unitary(n_qubits,params,op_codes,q1,q2):
     return psi
 
 def loss(n_qubits,params,op_codes,q1,q2,target_state):
-    psi = apply_unitary(n_qubits=12,params=params,op_codes=op_codes,q1=q1,q2=q2)
+    psi = apply_unitary(n_qubits=n_qubits,params=params,op_codes=op_codes,q1=q1,q2=q2)
     return -abs(np.vdot(target_state, psi)) ** 2
 
 
-# -----------------------------
-# Example usage
-# -----------------------------
+
+def optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
+                    method="L-BFGS-B", maxiter=200):
+    """
+    Minimize loss(params) using SciPy.
+
+    Returns: OptimizeResult
+    """
+    def f(p):
+        return loss(n_qubits=n_qubits, params=p, op_codes=op_codes, q1=q1, q2=q2, target_state=target_state)
+
+    result = minimize(
+        f,
+        x0=np.array(params, dtype=float),
+        method=method,
+        options={"maxiter": maxiter, "disp": True},
+    )
+    return result
+
+
+
+
+def find_best_op(n_qubits, params, op_codes, q1, q2, target_state, pool,
+                 method="L-BFGS-B", maxiter=200):
+
+    opt_old = optimize_params(n_qubits, params, op_codes, q1, q2, target_state,
+                              method=method, maxiter=maxiter)
+    old_loss = opt_old.fun
+
+    best_improvement = 0.0
+    best_choice = None
+    best_params_full = None
+
+    for (op, qq1, qq2) in pool:
+        params_new   = np.append(params, 0.0)
+        op_codes_new = np.append(op_codes, op)
+        q1_new       = np.append(q1, qq1)
+        q2_new       = np.append(q2, qq2)
+
+        opt_new = optimize_params(n_qubits, params_new, op_codes_new, q1_new, q2_new, target_state,
+                                  method=method, maxiter=maxiter)
+        new_loss = opt_new.fun
+
+        improvement = old_loss - new_loss  # positive means better (loss decreased)
+
+        if improvement > best_improvement:
+            best_improvement = improvement
+            best_choice = (op, qq1, qq2, op_codes_new, q1_new, q2_new)
+            best_params_full = opt_new.x     # FULL optimized param vector
+
+    if best_choice is None:
+        # no improvement found; return original
+        return params, op_codes, q1, q2
+
+    op, qq1, qq2, op_codes_new, q1_new, q2_new = best_choice
+
+    # IMPORTANT: replace params with the full optimized vector (do NOT append)
+    params_new = best_params_full
+
+    return params_new, op_codes_new, q1_new, q2_new, best_improvement
+
+def adapt_vqe(n_qubits, target, pool, max_op, eps=0.01, method="L-BFGS-B", maxiter=200):
+    params  = np.array([], dtype=float)
+    op_codes = np.array([], dtype=int)
+    q1       = np.array([], dtype=int)
+    q2       = np.array([], dtype=int)
+
+    for i in range(max_op):
+        print("operation: ", i,"-----", i/max_op*100, " %")
+        print()
+        params, op_codes, q1, q2, imp=find_best_op(n_qubits, params, op_codes, q1, q2, target, pool=pool, 
+                                              method="L-BFGS-B", maxiter=200)
+        if imp<eps:
+            return params, op_codes, q1, q2
+    return params, op_codes, q1, q2
+        
+
+
+
+
+
+
 if __name__ == "__main__":
-    n_qubits=12
-    params   = np.array([0.1, 0.2, 0.7], dtype=float)
-    op_codes = np.array([OP_RX, OP_RZZ, OP_RY], dtype=int)
-    q1       = np.array([0, 0, 5], dtype=int)
-    q2       = np.array([0, 1, 0], dtype=int)
-    psi = random_haar_state(n_qubits)
+    n_qubits = 12
+    max_op=20
+    eps=0
+    pool=make_default_pool(n_qubits)
 
-    loss = loss(n_qubits=n_qubits,params=params,op_codes=op_codes,q1=q1,q2=q2,target_state=psi)
-    print(-loss)
+    target = random_haar_state(n_qubits)
 
-    # norm = np.vdot(psi, psi).real
-    # print("Final state shape:", psi.shape)
-    # print("Norm:", norm)
-    # print("First 8 amplitudes:", psi[:8])
+    params, op_codes, q1, q2=adapt_vqe(n_qubits, target, pool, max_op, eps=eps, 
+                                       method="L-BFGS-B", maxiter=200)
+
+    
+    best_loss=loss(n_qubits,params,op_codes,q1,q2,target)
+    
+
+
+    
+    print("\nop_codes:", op_codes)
+    print("Best fidelity:", -best_loss)
+    #print("Best params:", params)
+    print("Best op_codes:", op_codes)
+    print("Best q1:", q1)
+    print("Best q2:", q2)
