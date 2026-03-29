@@ -13,18 +13,18 @@ from functools import partial
 from qiskit import QuantumCircuit
 
 
-# ============================================================
+ 
 # Op-codes
-# ============================================================
+   
 OP_RX  = 0
 OP_RY  = 1
 OP_RZ  = 2
 OP_RZZ = 3
 
 
-# ============================================================
+   
 # Pool construction
-# ============================================================
+   
 def make_default_pool(n_qubits):
     pool = []
 
@@ -49,9 +49,9 @@ def pool_to_arrays(pool):
     return jnp.asarray(ops), jnp.asarray(q1), jnp.asarray(q2)
 
 
-# ============================================================
+   
 # States
-# ============================================================
+   
 def init_state(n_qubits):
     dim = 1 << n_qubits
     psi = jnp.zeros((dim,), dtype=jnp.complex128)
@@ -69,9 +69,9 @@ def random_haar_state(n_qubits, key):
     return psi.astype(jnp.complex128)
 
 
-# ============================================================
+   
 # Gate matrices
-# ============================================================
+   
 def RX(theta):
     c = jnp.cos(theta / 2.0)
     s = jnp.sin(theta / 2.0)
@@ -91,9 +91,9 @@ def RZ(theta):
                       [0.0, jnp.exp(1j * theta / 2.0)]], dtype=jnp.complex128)
 
 
-# ============================================================
+   
 # Precomputation
-# ============================================================
+   
 def precompute_1q_indices(n_qubits):
     """
     For each qubit q, precompute index arrays i0[q], i1[q]
@@ -143,9 +143,9 @@ def build_sign_tensor(n_qubits):
     return jnp.asarray(signs, dtype=jnp.float64)
 
 
-# ============================================================
+   
 # Gate application
-# ============================================================
+   
 def apply_1q_gate(psi, U, q, i0_table, i1_table):
     i0 = i0_table[q]
     i1 = i1_table[q]
@@ -182,9 +182,9 @@ def apply_op(psi, theta, op, qa, qb, i0_table, i1_table, sign_tensor):
     return jax.lax.switch(op, [do_rx, do_ry, do_rz, do_rzz], operand=None)
 
 
-# ============================================================
+   
 # Circuit execution
-# ============================================================
+   
 @partial(jit, static_argnames=("n_qubits",))
 def apply_unitary(n_qubits, params, op_codes, q1, q2, i0_table, i1_table, sign_tensor):
     psi0 = init_state(n_qubits)
@@ -215,9 +215,9 @@ def make_loss_fn(n_qubits, op_codes, q1, q2, target_state, i0_table, i1_table, s
     return f
 
 
-# ============================================================
+   
 # Optimization
-# ============================================================
+   
 def optimize_params(
     n_qubits,
     params,
@@ -264,9 +264,9 @@ def optimize_params(
     return result
 
 
-# ============================================================
+   
 # Candidate scoring for ADAPT
-# ============================================================
+   
 @partial(jit, static_argnames=("n_qubits",))
 def candidate_grad_score(
     n_qubits,
@@ -422,9 +422,9 @@ def find_best_op(
     return params_new, op_codes_new, q1_new, q2_new, best_score
 
 
-# ============================================================
+   
 # Circuit presentation
-# ============================================================
+   
 def build_qiskit_circuit(n_qubits, params, op_codes, q1, q2):
     qc = QuantumCircuit(n_qubits)
 
@@ -470,9 +470,9 @@ def print_circuit_summary(params, op_codes, q1, q2):
             print(f"{i:4d}  {name:>5}  {a:3d}  {'-':>3}  {float(theta):14.8f}")
 
 
-# ============================================================
+   
 # ADAPT-VQE loop
-# ============================================================
+   
 def adapt_vqe(
     n_qubits,
     target,
@@ -556,9 +556,9 @@ def adapt_vqe(
     return params, op_codes, q1, q2, fidelities, delta_fidelities
 
 
-# ============================================================
+   
 # Main
-# ============================================================
+   
 if __name__ == "__main__":
     n_qubits = 6#12
     max_op   = 200
@@ -609,9 +609,9 @@ if __name__ == "__main__":
         print("You can still use the text circuit above.")
         print("If needed, install: pip install qiskit pylatexenc")
 
-   # ============================================================
-    # Plot: ONLY fidelity
-    # ============================================================
+      
+    # Plot
+       
     steps = np.arange(1, len(fidelities) + 1)
     plt.figure()
     plt.plot(steps, fidelities, linewidth=2)
