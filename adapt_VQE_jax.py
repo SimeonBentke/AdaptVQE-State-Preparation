@@ -614,7 +614,7 @@ if __name__ == "__main__":
        
     steps = np.arange(1, len(fidelities) + 1)
     plt.figure()
-    plt.plot(steps, fidelities, linewidth=2)
+    plt.plot(steps, fidelities, linewidth=1.9)
 
     plt.xlabel("Number of operators")
     plt.ylabel("Fidelity")
